@@ -1,0 +1,71 @@
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import urllib.parse
+import requests
+import logging
+
+PORT = 8080
+TIMEOUT = 10
+RETRIES = 3
+POOL_SIZE = 200
+
+logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s: %(message)s')
+
+# Global session with connection pooling
+session = requests.Session()
+adapter = requests.adapters.HTTPAdapter(max_retries=RETRIES, pool_maxsize=POOL_SIZE)
+session.mount('http://', adapter)
+session.mount('https://', adapter)
+
+class TurboProxy(BaseHTTPRequestHandler):
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self.send_cors_headers()
+        self.end_headers()
+
+    def do_GET(self): self.proxy('GET')
+    def do_POST(self): self.proxy('POST')
+    def do_PUT(self): self.proxy('PUT')
+    def do_DELETE(self): self.proxy('DELETE')
+    def do_PATCH(self): self.proxy('PATCH')
+
+    def proxy(self, method):
+        parsed = urllib.parse.urlparse(self.path)
+        query = urllib.parse.parse_qs(parsed.query)
+        target = query.get('url', [None])[0]
+
+        if not target:
+            self.send_error(400, "Missing 'url' query parameter")
+            return
+
+        try:
+            headers = {k: v for k, v in self.headers.items() if k.lower() not in {
+                'host', 'content-length', 'accept-encoding', 'connection'
+            }}
+            body = self.rfile.read(int(self.headers.get('Content-Length', 0))) if method in ['POST', 'PUT', 'PATCH'] else None
+
+            response = session.request(method, target, headers=headers, data=body, timeout=TIMEOUT, stream=True)
+
+            self.send_response(response.status_code)
+            self.send_cors_headers()
+            for k, v in response.headers.items():
+                if k.lower() not in {'transfer-encoding', 'content-encoding', 'content-length'}:
+                    self.send_header(k, v)
+            self.end_headers()
+
+            for chunk in response.iter_content(chunk_size=8192):
+                if chunk:
+                    self.wfile.write(chunk)
+
+        except requests.exceptions.RequestException as e:
+            logging.error(f"Proxy error: {e}")
+            self.send_error(502, f"Upstream error: {str(e)}")
+
+    def send_cors_headers(self):
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, PATCH, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+
+if __name__ == "__main__":
+    server = ThreadingHTTPServer(('', PORT), TurboProxy)
+    logging.info(f"🚀 Turbo proxy running on http://localhost:{PORT}")
+    server.serve_forever()
